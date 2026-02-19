@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="BÜ Buchschlag">
+<meta name="theme-color" content="#020617">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚧</text></svg>">
+<title>BÜ Buchschlag · Schranken-Prognose</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.1}}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html{height:100%;-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{background:#020617;overflow-x:hidden;min-height:100%;-webkit-overflow-scrolling:touch;overscroll-behavior-y:none}
+#root{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}
+::-webkit-scrollbar{width:0;height:0}
+button{-webkit-appearance:none;touch-action:manipulation}
+input{-webkit-appearance:none;appearance:none;touch-action:manipulation;font-size:16px!important}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+// ═══════════════════════════════════════════════════════════════
+// STABILES PROGNOSEMODELL – BÜ Dreieich-Buchschlag
+// ═══════════════════════════════════════════════════════════════
+// 5 Gleise: Gl.1 Dreieichbahn, Gl.2+3 S-Bahn, Gl.4+5 Durchfahrt
+// Schranke = signalabhängig, schließt VOR Signalfreigabe
+// Kernproblem: Viele Züge dicht hintereinander → bleibt lange zu
+// ═══════════════════════════════════════════════════════════════
+
+const CLOSE_BEFORE = 180;
+const OPEN_AFTER = 40;
+const MERGE_GAP = 240;
+const MIN_OPEN = 90;
+
+const CAT = {
+  S:  { color: "#2dd4bf", label: "S-Bahn" },
+  RB: { color: "#f472b6", label: "RB" },
+  RE: { color: "#f472b6", label: "RE" },
+  ICE:{ color: "#a78bfa", label: "ICE" },
+  IC: { color: "#a78bfa", label: "IC" },
+  EC: { color: "#a78bfa", label: "EC" },
+  G:  { color: "#94a3b8", label: "Güter" },
+};
+
+function buildSchedule(date) {
+  const day = date.getDay();
+  const isSun = day === 0;
+  const isSat = day === 6;
+  const isWd = !isSun && !isSat;
+  const trains = [];
+
+  const add = (h, m, cat, line, dest, track, stops) => {
+    if (h < 0 || h > 23) return;
+    const t = new Date(date);
+    t.setHours(h, m, 0, 0);
+    trains.push({
+      id: `${line.replace(/\s/g,"")}-${h}${String(m).padStart(2,"0")}`,
+      cat, line, dest, track, stops,
+      sched: new Date(t), actual: new Date(t), delay: 0,
+      through: !stops,
+    });
+  };
+
+  for (let h = 5; h <= 23; h++) {
+    const hvz = isWd && ((h >= 6 && h <= 9) || (h >= 16 && h <= 19));
+    const s6m = (hvz ? [8,23,38,53] : (h===5||h===23) ? [38] : [8,38]);
+    s6m.forEach(m => {
+      add(h, m, "S", "S 6", m%30===8 ? "Friedberg(Hess)" : "Bad Vilbel", 2, true);
+      add(h, m, "S", "S 6", m%30===8 ? "Darmstadt Hbf" : "Langen(Hess)", 3, true);
+    });
+    if (h >= 6 && h <= 22) {
+      add(h, 27, "RB", "RB 61", h%2===0 ? "Dieburg" : "Ffm Hbf", 1, true);
+      if (hvz || (h >= 7 && h <= 20 && !isSun)) {
+        add(h, 50, "RB", "RB 61", h%2===0 ? "Ffm Hbf" : "Ober Roden", 1, true);
+      }
+    }
+    if (h >= 6 && h <= 22) {
+      add(h, 12, "ICE", `ICE ${100+h*2}`, "Stuttgart Hbf", 4, false);
+      add(h, 18, "ICE", `ICE ${101+h*2}`, "Ffm Hbf", 5, false);
+      if (h%2===0) add(h, 42, "IC", `IC ${200+h}`, "Heidelberg Hbf", 4, false);
+      if (h%2===1) add(h, 48, "EC", `EC ${50+h}`, "Ffm Hbf", 5, false);
+    }
+    if (h < 7 || h > 20) {
+      add(h, 5, "G", "GZ", "Mannheim Rbf", 4, false);
+      add(h, 35, "G", "GZ", "Ffm Ost Gbf", 5, false);
+    } else if (h%3===0) {
+      add(h, 32, "G", "GZ", "Mannheim Rbf", 4, false);
+    }
+  }
+  return trains.sort((a, b) => a.sched - b.sched);
+}
+
+function addDelays(trains, seed) {
+  let s = seed + 7;
+  const rnd = () => { s = (s * 48271) % 2147483647; return s / 2147483647; };
+  return trains.map(t => {
+    const r = rnd();
+    let d = 0;
+    if (t.cat === "G" && r < 0.35) d = 1 + Math.floor(rnd() * 18);
+    else if (t.cat === "ICE" || t.cat === "IC" || t.cat === "EC") { if (r < 0.3) d = 1 + Math.floor(rnd() * 12); }
+    else if (t.cat === "S" && r < 0.2) d = 1 + Math.floor(rnd() * 6);
+    else if (t.cat === "RB" && r < 0.15) d = 1 + Math.floor(rnd() * 8);
+    return { ...t, delay: d, actual: new Date(t.sched.getTime() + d * 60000) };
+  });
+}
+
+function calcPhases(trains) {
+  const evts = trains.map(t => ({ close: new Date(t.actual.getTime() - CLOSE_BEFORE * 1000), open: new Date(t.actual.getTime() + OPEN_AFTER * 1000), train: t })).sort((a, b) => a.close - b.close);
+  const phases = [];
+  let cur = null;
+  for (const e of evts) {
+    if (!cur) { cur = { closeAt: e.close, openAt: e.open, trains: [e.train] }; }
+    else {
+      const gap = (e.close - cur.openAt) / 1000;
+      if (gap < MERGE_GAP || gap < MIN_OPEN) { cur.openAt = new Date(Math.max(cur.openAt.getTime(), e.open.getTime())); cur.trains.push(e.train); }
+      else { phases.push(cur); cur = { closeAt: e.close, openAt: e.open, trains: [e.train] }; }
+    }
+  }
+  if (cur) phases.push(cur);
+  return phases;
+}
+
+function getStatus(phases, now) {
+  for (const p of phases) { if (now >= p.closeAt && now <= p.openAt) return { closed: true, until: p.openAt, since: p.closeAt, phase: p }; }
+  const next = phases.find(p => p.closeAt > now);
+  return { closed: false, until: next?.closeAt || null, nextPhase: next || null };
+}
+
+const fmt = d => d ? d.toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit"}) : "--:--";
+const fmtS = d => d ? d.toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit",second:"2-digit"}) : "";
+function cd(target, now) { if (!target) return { m:"--", s:"--", t:Infinity }; const d = Math.max(0, Math.floor((target - now) / 1000)); return { m: String(Math.floor(d/60)).padStart(2,"0"), s: String(d%60).padStart(2,"0"), t: d }; }
+function durMin(a, b) { return Math.max(1, Math.round((b - a) / 60000)); }
+
+const QUEUE_PARAMS = {
+  arrivalRate: { hvz: 10, nvz: 4, nacht: 1 },
+  departureRate: 18,
+  reactionDelay: 8,
+  crossingTimePerCar: 3.5,
+  maxQueue: 120,
+};
+
+function getTimeCategory(date) {
+  const h = date.getHours();
+  const day = date.getDay();
+  const isWeekday = day >= 1 && day <= 5;
+  if (!isWeekday) return h >= 9 && h <= 18 ? "nvz" : "nacht";
+  if ((h >= 7 && h <= 9) || (h >= 16 && h <= 19)) return "hvz";
+  if (h >= 6 && h <= 21) return "nvz";
+  return "nacht";
+}
+
+function estimateQueue(phases, now, liveTrafficRatio) {
+  const timeCat = getTimeCategory(now);
+  let baseArrival = QUEUE_PARAMS.arrivalRate[timeCat];
+  if (liveTrafficRatio !== null && liveTrafficRatio !== undefined) {
+    const congestionFactor = 1 + (1 - liveTrafficRatio) * 1.5;
+    baseArrival = Math.round(baseArrival * congestionFactor);
+  }
+  let currentClosed = null;
+  let prevClosed = null;
+  for (const p of phases) { if (now >= p.closeAt && now <= p.openAt) { currentClosed = p; break; } if (p.openAt < now) prevClosed = p; }
+  let queueLength = 0, clearTimeSeconds = 0, effectiveOpenDelay = 0;
+  if (currentClosed) {
+    const closedMinutes = (now - currentClosed.closeAt) / 60000;
+    queueLength = Math.min(QUEUE_PARAMS.maxQueue, Math.round(baseArrival * closedMinutes));
+    clearTimeSeconds = QUEUE_PARAMS.reactionDelay + Math.round(queueLength * QUEUE_PARAMS.crossingTimePerCar);
+    effectiveOpenDelay = clearTimeSeconds;
+  } else if (prevClosed) {
+    const openSince = (now - prevClosed.openAt) / 1000;
+    const closedDuration = (prevClosed.openAt - prevClosed.closeAt) / 60000;
+    const peakQueue = Math.min(QUEUE_PARAMS.maxQueue, Math.round(baseArrival * closedDuration));
+    const effectiveOpenSec = Math.max(0, openSince - QUEUE_PARAMS.reactionDelay);
+    const departed = Math.floor((effectiveOpenSec / 60) * QUEUE_PARAMS.departureRate);
+    queueLength = Math.max(0, peakQueue - departed);
+    clearTimeSeconds = queueLength > 0 ? Math.round(queueLength * QUEUE_PARAMS.crossingTimePerCar) : 0;
+    effectiveOpenDelay = clearTimeSeconds;
+  }
+  return { queueLength, clearTimeSeconds, effectiveOpenDelay, waitPosition: queueLength + 1, arrivalRate: baseArrival, timeCat, hasLiveTraffic: liveTrafficRatio !== null && liveTrafficRatio !== undefined, trafficRatio: liveTrafficRatio };
+}
+
+const BU_LAT = 50.0025;
+const BU_LON = 8.6585;
+
+async function fetchTrafficData(apiKey) {
+  if (!apiKey) return null;
+  try {
+    // HERE Traffic API v7 — flow data within 200m radius of BÜ
+    const url = `https://data.traffic.hereapi.com/v7/flow?in=circle:${BU_LAT},${BU_LON};r=200&locationReferencing=none&apiKey=${apiKey}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const results = data?.results;
+    if (!results || results.length === 0) return null;
+    // Find best match — pick the segment with highest functional class (main road)
+    let bestFlow = null;
+    let bestJam = -1;
+    for (const item of results) {
+      const cf = item.currentFlow;
+      if (cf && (bestFlow === null || (cf.freeFlow || 0) > (bestFlow.freeFlow || 0))) {
+        bestFlow = cf;
+      }
+    }
+    if (!bestFlow) return null;
+    // HERE speed is in m/s — convert to km/h
+    const currentSpeed = Math.round((bestFlow.speed || 0) * 3.6);
+    const freeFlowSpeed = Math.round((bestFlow.freeFlow || 0) * 3.6);
+    const jamFactor = bestFlow.jamFactor || 0; // 0=free, 10=standstill
+    const ratio = freeFlowSpeed > 0 ? currentSpeed / freeFlowSpeed : 1;
+    const roadClosed = bestFlow.traversability === "closed";
+    return { currentSpeed, freeFlowSpeed, ratio, jamFactor, confidence: 1, roadClosed };
+  } catch(e) { return null; }
+}
+
+// ─── TRAFFIC DISPLAY (mit HERE Traffic API) ──────────
+
+function TrafficDisplay({ trafficData, trafficKey, trafficStatus }) {
+  if (!trafficKey) return null;
+
+  // Loading / Error states
+  if (trafficStatus === "loading" || (trafficStatus !== "live" && !trafficData)) {
+    return (
+      <div style={{ margin:"0 16px 16px", padding:"20px", borderRadius:14, background:"#080e1a", border:"1px solid #1e293b", textAlign:"center" }}>
+        <div style={{ fontSize:12, color:"#475569", letterSpacing:"0.12em", marginBottom:12 }}>VERKEHRSLAGE · BUCHSCHLAGER ALLEE</div>
+        {trafficStatus === "error" ? (
+          <div style={{ padding:"14px 18px", borderRadius:10, background:"#7f1d1d20", border:"1px solid #ef444430" }}>
+            <div style={{ fontSize:14, color:"#fca5a5", fontWeight:600 }}>⚠️ Traffic API nicht erreichbar</div>
+            <div style={{ fontSize:12, color:"#64748b", marginTop:4 }}>Ungültiger Key oder Netzwerkfehler. Nächster Versuch in 2 Min.</div>
+          </div>
+        ) : (
+          <div style={{ fontSize:14, color:"#64748b" }}>⏳ Verkehrsdaten werden geladen...</div>
+        )}
+      </div>
+    );
+  }
+
+  if (!trafficData) return null;
+
+  const ratio = trafficData.ratio;
+  const pct = Math.round(ratio * 100);
+  const current = Math.round(trafficData.currentSpeed);
+  const freeFlow = Math.round(trafficData.freeFlowSpeed);
+  const diff = freeFlow - current;
+
+  // Stau-Level
+  let level, levelColor, levelBg, levelBorder, levelIcon, levelText;
+  if (trafficData.roadClosed) {
+    level = "GESPERRT"; levelColor = "#f87171"; levelBg = "#7f1d1d30"; levelBorder = "#ef444450"; levelIcon = "🚫"; levelText = "Straße ist aktuell gesperrt!";
+  } else if (ratio >= 0.85) {
+    level = "FREI"; levelColor = "#4ade80"; levelBg = "#14532d30"; levelBorder = "#22c55e40"; levelIcon = "🟢"; levelText = "Freier Verkehrsfluss — keine Verzögerung";
+  } else if (ratio >= 0.6) {
+    level = "MÄSSIG"; levelColor = "#fbbf24"; levelBg = "#78350f20"; levelBorder = "#f59e0b40"; levelIcon = "🟡"; levelText = `Leicht zähfließend — ${diff} km/h unter Normalgeschwindigkeit`;
+  } else if (ratio >= 0.35) {
+    level = "STOCKEND"; levelColor = "#fb923c"; levelBg = "#7c2d1220"; levelBorder = "#f9731640"; levelIcon = "🟠"; levelText = `Stockender Verkehr — ${diff} km/h unter Normal`;
+  } else {
+    level = "STAU"; levelColor = "#ef4444"; levelBg = "#7f1d1d25"; levelBorder = "#ef444440"; levelIcon = "🔴"; levelText = `Schwerer Stau — nur ${current} km/h statt ${freeFlow} km/h`;
+  }
+
+  // Gauge-Berechnung (Halbkreis)
+  const gaugeAngle = Math.min(180, Math.max(0, ratio * 180));
+
+  return (
+    <div style={{ margin:"0 16px 16px", borderRadius:14, overflow:"hidden", border:"1px solid #1e293b", background:"#080e1a" }}>
+      {/* Header */}
+      <div style={{ padding:"16px 20px 0", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div style={{ fontSize:12, color:"#475569", letterSpacing:"0.12em" }}>VERKEHRSLAGE · BUCHSCHLAGER ALLEE</div>
+        <span style={{ fontSize:10, padding:"2px 8px", borderRadius:6, background:"#22c55e18", border:"1px solid #22c55e40", color:"#4ade80", fontFamily:"'Space Mono',monospace" }}>
+          <span style={{ display:"inline-block", width:5, height:5, borderRadius:"50%", background:"#22c55e", marginRight:4, animation:"pulse 2s ease-in-out infinite" }}/>LIVE
+        </span>
+      </div>
+
+      {/* Ampel-Level */}
+      <div style={{ margin:"14px 20px", padding:"14px 18px", borderRadius:12, background:levelBg, border:`1px solid ${levelBorder}` }}>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          <span style={{ fontSize:28 }}>{levelIcon}</span>
+          <div style={{ flex:1 }}>
+            <div style={{ fontSize:20, fontWeight:700, color:levelColor, fontFamily:"'Space Mono',monospace", letterSpacing:"0.08em" }}>{level}</div>
+            <div style={{ fontSize:13, color:"#94a3b8", marginTop:2 }}>{levelText}</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Geschwindigkeitsanzeige */}
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, padding:"0 20px 16px" }}>
+        <div style={{ padding:"14px 12px", background:"#020617", borderRadius:10, textAlign:"center" }}>
+          <div style={{ fontSize:10, color:"#475569", marginBottom:6, letterSpacing:"0.05em" }}>AKTUELL</div>
+          <div style={{ fontSize:28, fontWeight:700, color:levelColor, fontFamily:"'Space Mono',monospace", lineHeight:1 }}>{current}</div>
+          <div style={{ fontSize:11, color:"#475569", marginTop:4 }}>km/h</div>
+        </div>
+        <div style={{ padding:"14px 12px", background:"#020617", borderRadius:10, textAlign:"center" }}>
+          <div style={{ fontSize:10, color:"#475569", marginBottom:6, letterSpacing:"0.05em" }}>NORMAL</div>
+          <div style={{ fontSize:28, fontWeight:700, color:"#64748b", fontFamily:"'Space Mono',monospace", lineHeight:1 }}>{freeFlow}</div>
+          <div style={{ fontSize:11, color:"#475569", marginTop:4 }}>km/h</div>
+        </div>
+        <div style={{ padding:"14px 12px", background:"#020617", borderRadius:10, textAlign:"center" }}>
+          <div style={{ fontSize:10, color:"#475569", marginBottom:6, letterSpacing:"0.05em" }}>FLUSS</div>
+          <div style={{ fontSize:28, fontWeight:700, color:levelColor, fontFamily:"'Space Mono',monospace", lineHeight:1 }}>{pct}%</div>
+          <div style={{ fontSize:11, color:"#475569", marginTop:4 }}>Kapazität</div>
+        </div>
+      </div>
+
+      {/* Geschwindigkeits-Balken */}
+      <div style={{ padding:"0 20px 16px" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <span style={{ fontSize:11, color:"#475569", fontFamily:"'Space Mono',monospace", width:30, textAlign:"right" }}>0</span>
+          <div style={{ flex:1, height:14, background:"#0f172a", borderRadius:7, overflow:"hidden", position:"relative" }}>
+            <div style={{ position:"absolute", top:0, bottom:0, left:`${Math.min(95, (freeFlow / 60) * 100)}%`, width:2, background:"#334155", zIndex:2 }}/>
+            <div style={{
+              height:"100%", borderRadius:7,
+              width:`${Math.min(100, (current / 60) * 100)}%`,
+              background: ratio >= 0.85 ? "linear-gradient(90deg,#22c55e,#16a34a)" :
+                           ratio >= 0.6 ? "linear-gradient(90deg,#22c55e,#f59e0b)" :
+                           ratio >= 0.35 ? "linear-gradient(90deg,#f59e0b,#fb923c)" :
+                                           "linear-gradient(90deg,#ef4444,#dc2626)",
+              transition:"width 2s ease",
+            }}/>
+          </div>
+          <span style={{ fontSize:11, color:"#475569", fontFamily:"'Space Mono',monospace", width:30 }}>60</span>
+        </div>
+        <div style={{ display:"flex", justifyContent:"space-between", marginTop:4 }}>
+          <span style={{ fontSize:10, color:"#334155" }}>Stau</span>
+          <span style={{ fontSize:10, color:"#334155" }}>Frei</span>
+        </div>
+      </div>
+
+      {/* Footer */}
+      <div style={{ padding:"10px 20px", display:"flex", justifyContent:"space-between", alignItems:"center", borderTop:"1px solid #0f172a" }}>
+        <span style={{ fontSize:10, color:"#334155" }}>via HERE Traffic API</span>
+        <span style={{ fontSize:10, color:"#334155" }}>Aktualisierung alle 2 Min</span>
+      </div>
+    </div>
+  );
+}
+
+function QueueDisplay({ queue, phases, now, status }) {
+  if (!queue) return null;
+  const closed = status.closed;
+  let canCross = null;
+  if (closed && status.until) {
+    const openDurationSec = (() => { const nextClose = phases.find(p => p.closeAt > status.until); return nextClose ? (nextClose.closeAt - status.until) / 1000 : 600; })();
+    canCross = (queue.clearTimeSeconds + QUEUE_PARAMS.crossingTimePerCar) < (openDurationSec - 10);
+  }
+  if (!closed && status.until) {
+    const remainingOpenSec = (status.until - now) / 1000;
+    canCross = (queue.clearTimeSeconds + QUEUE_PARAMS.crossingTimePerCar) < (remainingOpenSec - 10);
+  }
+  const qBar = Math.min(100, (queue.queueLength / 60) * 100);
+  const catLabels = { hvz: "Hauptverkehrszeit", nvz: "Normalverkehr", nacht: "Schwachverkehr" };
+  return (
+    <div style={{ margin:"0 16px 16px", padding:"18px 20px", background:"#080e1a", borderRadius:14, border:"1px solid #1e293b" }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
+        <div style={{ fontSize:12, color:"#475569", letterSpacing:"0.12em" }}>RÜCKSTAU-PROGNOSE</div>
+        {queue.hasLiveTraffic && (<span style={{ fontSize:10, padding:"2px 8px", borderRadius:6, background:"#22c55e18", border:"1px solid #22c55e40", color:"#4ade80", fontFamily:"'Space Mono',monospace" }}><span style={{ display:"inline-block", width:5, height:5, borderRadius:"50%", background:"#22c55e", marginRight:4 }}/>LIVE</span>)}
+      </div>
+      <div style={{ marginBottom:14 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
+          <span style={{ fontSize:14, fontWeight:600, color:"#cbd5e1" }}>~{queue.queueLength} Fahrzeuge</span>
+          <span style={{ fontSize:12, color:"#64748b", fontFamily:"'Space Mono',monospace" }}>{catLabels[queue.timeCat]} · ~{queue.arrivalRate} Fzg/min</span>
+        </div>
+        <div style={{ height:10, background:"#0f172a", borderRadius:5, overflow:"hidden" }}>
+          <div style={{ height:"100%", borderRadius:5, width:`${qBar}%`, background: qBar > 70 ? "linear-gradient(90deg,#ef4444,#dc2626)" : qBar > 35 ? "linear-gradient(90deg,#f59e0b,#d97706)" : "linear-gradient(90deg,#22c55e,#16a34a)", transition:"width 1s ease" }}/>
+        </div>
+        <div style={{ display:"flex", justifyContent:"space-between", marginTop:4 }}>
+          <span style={{ fontSize:10, color:"#334155" }}>0</span>
+          <span style={{ fontSize:10, color:"#334155" }}>~60+ Fzg</span>
+        </div>
+      </div>
+      {queue.clearTimeSeconds > 0 && (
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
+          <div style={{ padding:"10px 12px", background:"#020617", borderRadius:8 }}>
+            <div style={{ fontSize:10, color:"#475569", marginBottom:4 }}>Abfluss nach Öffnung</div>
+            <div style={{ fontSize:18, fontWeight:700, color:"#fbbf24", fontFamily:"'Space Mono',monospace" }}>~{Math.ceil(queue.clearTimeSeconds / 60)} Min</div>
+          </div>
+          <div style={{ padding:"10px 12px", background:"#020617", borderRadius:8 }}>
+            <div style={{ fontSize:10, color:"#475569", marginBottom:4 }}>Deine Position ca.</div>
+            <div style={{ fontSize:18, fontWeight:700, color:"#94a3b8", fontFamily:"'Space Mono',monospace" }}>Platz {queue.waitPosition}</div>
+          </div>
+        </div>
+      )}
+      {canCross !== null && (
+        <div style={{ padding:"12px 16px", borderRadius:10, background: canCross ? "#14532d30" : "#7f1d1d25", border: canCross ? "1px solid #22c55e40" : "1px solid #ef444440" }}>
+          <div style={{ fontSize:15, fontWeight:700, color: canCross ? "#86efac" : "#fca5a5" }}>
+            {canCross ? "✅ Du schaffst es voraussichtlich drüber" : "⚠️ Offene Phase reicht evtl. nicht — Umweg prüfen"}
+          </div>
+          <div style={{ fontSize:12, color:"#64748b", marginTop:4 }}>
+            {canCross ? `Rückstau löst sich in ~${Math.ceil(queue.clearTimeSeconds/60)} Min auf, offene Phase ist lang genug.` : `Rückstau braucht ~${Math.ceil(queue.clearTimeSeconds/60)} Min zum Abfließen. Nächste Schließung könnte vorher kommen.`}
+          </div>
+        </div>
+      )}
+      {queue.hasLiveTraffic && queue.trafficRatio !== null && (
+        <div style={{ marginTop:12, display:"flex", alignItems:"center", gap:8 }}>
+          <span style={{ width:10, height:10, borderRadius:"50%", background: queue.trafficRatio > 0.7 ? "#22c55e" : queue.trafficRatio > 0.4 ? "#f59e0b" : "#ef4444" }}/>
+          <span style={{ fontSize:12, color:"#64748b" }}>Verkehrsfluss: {Math.round(queue.trafficRatio * 100)}% der Normalgeschwindigkeit<span style={{ color:"#334155" }}> · via HERE</span></span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── v6.db.transport.rest API (CORS-fähig, kein Key nötig) ──
+// Öffentliche REST API mit echten DB-Daten inkl. Echtzeit-Verspätungen
+// EVA 8001236 = Dreieich-Buchschlag
+// Rate Limit: 100 req/min — wir holen alle 90s → ~0.67 req/min
+
+const EVA = "8001236";
+const REST_API = "https://v6.db.transport.rest";
+
+function mapProduct(product) {
+  if (product === "nationalExpress") return "ICE";
+  if (product === "national") return "IC";
+  if (product === "regionalExpress") return "RE";
+  if (product === "regional") return "RB";
+  if (product === "suburban") return "S";
+  if (product === "bus") return "Bus";
+  return "S";
+}
+
+async function fetchLiveTrains() {
+  try {
+    const url = `${REST_API}/stops/${EVA}/departures?duration=120&results=60&bus=false&ferry=false&taxi=false`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`API ${res.status}`);
+    const raw = await res.json();
+    const deps = Array.isArray(raw) ? raw : (raw.departures || []);
+    // Also fetch arrivals for through-trains
+    const arrUrl = `${REST_API}/stops/${EVA}/arrivals?duration=120&results=60&bus=false&ferry=false&taxi=false`;
+    let arrs = [];
+    try { const arrRes = await fetch(arrUrl); if (arrRes.ok) { const rawA = await arrRes.json(); arrs = Array.isArray(rawA) ? rawA : (rawA.arrivals || []); } } catch(e) {}
+    // Merge: departures are primary, add arrivals not in departures (through-trains)
+    const seenTrips = new Set(deps.map(d => d.tripId));
+    const allDeps = [...deps];
+    arrs.forEach(a => { if (!seenTrips.has(a.tripId)) { allDeps.push(a); seenTrips.add(a.tripId); } });
+    
+    const trains = allDeps.map((d, i) => {
+      const cat = mapProduct(d.line?.product || "");
+      const lineName = d.line?.name || `${cat} ?`;
+      const sched = new Date(d.plannedWhen || d.when);
+      const actual = new Date(d.when || d.plannedWhen);
+      const delaySec = d.delay || 0;
+      const delayMin = Math.round(delaySec / 60);
+      const platform = parseInt(d.platform || d.plannedPlatform || "1");
+      const dest = d.direction || d.destination?.name || "unbekannt";
+      const stopsHere = ["S","RB","RE"].includes(cat);
+      return {
+        id: `live-${d.tripId || i}`,
+        cat, line: lineName, dest,
+        track: platform, stops: stopsHere,
+        sched, actual, delay: delayMin,
+        through: !stopsHere,
+      };
+    });
+    return trains.length > 0 ? trains.sort((a,b) => a.sched - b.sched) : null;
+  } catch(e) {
+    console.warn("Live API:", e.message);
+    return null;
+  }
+}
+
+function SettingsPanel({ show, onClose, liveEnabled, onToggleLive, trafficKey, onSaveTrafficKey }) {
+  const [ttKey, setTtKey] = useState(trafficKey || "");
+  if (!show) return null;
+  const inp = { width:"100%", padding:"14px", borderRadius:8, background:"#0f172a", border:"1px solid #1e293b", color:"#e2e8f0", fontSize:16, fontFamily:"'Space Mono',monospace", outline:"none", marginTop:6 };
+  return (
+    <div style={{ position:"fixed", inset:0, zIndex:100, background:"#020617ee", backdropFilter:"blur(8px)", display:"flex", alignItems:"flex-end", justifyContent:"center" }} onClick={(e) => { if (e.target === e.currentTarget) { onSaveTrafficKey(ttKey.trim()); onClose(); } }}>
+      <div style={{ width:"100%", maxWidth:560, maxHeight:"90vh", overflowY:"auto", WebkitOverflowScrolling:"touch", padding:"28px 24px 36px", background:"#0a0f1a", borderRadius:"20px 20px 0 0", border:"1px solid #1e293b", borderBottom:"none" }} onClick={e => e.stopPropagation()}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
+          <span style={{ fontSize:20, fontWeight:700, color:"#f1f5f9" }}>⚙️ Einstellungen</span>
+          <button onClick={() => { onSaveTrafficKey(ttKey.trim()); onClose(); }} style={{ background:"none", border:"none", color:"#64748b", fontSize:24, cursor:"pointer", padding:"8px 12px" }}>✕</button>
+        </div>
+
+        {/* Live-Daten Toggle */}
+        <div style={{ padding:16, borderRadius:12, marginBottom:16, background:"#020617", border:"1px solid #1e293b" }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <div>
+              <div style={{ fontSize:15, fontWeight:600, color:"#94a3b8", marginBottom:4 }}>🚂 Echte Zugdaten</div>
+              <div style={{ fontSize:12, color:"#475569", lineHeight:1.6 }}>Live-Daten via db.transport.rest — kein API-Key nötig!</div>
+            </div>
+            <button onClick={(e) => { e.stopPropagation(); onToggleLive(); }} style={{
+              width:52, height:30, borderRadius:15, border:"none", cursor:"pointer", position:"relative", transition:"background 0.3s",
+              background: liveEnabled ? "#22c55e" : "#334155",
+            }}>
+              <span style={{ position:"absolute", top:3, left: liveEnabled ? 25 : 3, width:24, height:24, borderRadius:"50%", background:"#fff", transition:"left 0.3s", boxShadow:"0 1px 3px rgba(0,0,0,0.3)" }}/>
+            </button>
+          </div>
+          {liveEnabled && (
+            <div style={{ marginTop:12, padding:"10px 12px", background:"#14532d30", borderRadius:8, border:"1px solid #22c55e30" }}>
+              <div style={{ fontSize:12, color:"#86efac" }}>✅ Live-Daten aktiv — Abfrage alle 90 Sekunden</div>
+              <div style={{ fontSize:11, color:"#475569", marginTop:4 }}>Inkl. Echtzeit-Verspätungen, Gleisänderungen, ICE/IC/S-Bahn/RB</div>
+            </div>
+          )}
+        </div>
+
+        {/* HERE Traffic */}
+        <div style={{ padding:16, borderRadius:12, marginBottom:16, background:"#020617", border:"1px solid #1e293b" }}>
+          <div style={{ fontSize:15, fontWeight:600, color:"#94a3b8", marginBottom:4 }}>🚗 HERE Traffic API</div>
+          <div style={{ fontSize:12, color:"#475569", lineHeight:1.6, marginBottom:16 }}>Optional — für Live-Staudaten. Kostenlos auf <span style={{color:"#3b82f6"}}>platform.here.com</span>.</div>
+          <label style={{ fontSize:12, color:"#64748b", fontWeight:600 }}>HERE API Key</label>
+          <input
+            value={ttKey}
+            onChange={e => { setTtKey(e.target.value); }}
+            onBlur={() => onSaveTrafficKey(ttKey.trim())}
+            placeholder="API Key einfügen..."
+            autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck="false"
+            style={inp}
+          />
+          {ttKey && (
+            <div style={{ display:"flex", gap:10, marginTop:12 }}>
+              <button onClick={() => { onSaveTrafficKey(ttKey.trim()); }} style={{ flex:1, padding:"12px 0", borderRadius:10, border:"none", background:"#22c55e", color:"#020617", fontSize:14, fontWeight:700, cursor:"pointer" }}>✓ Übernehmen</button>
+              <button onClick={() => { setTtKey(""); onSaveTrafficKey(""); }} style={{ padding:"12px 16px", borderRadius:10, background:"#1e293b", border:"none", color:"#94a3b8", fontSize:14, cursor:"pointer" }}>Löschen</button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Countdown({ target, now, label }) {
+  const c = cd(target, now);
+  const warn = c.t < 120;
+  const crit = c.t < 30;
+  return (
+    <div style={{ textAlign:"center", padding:"12px 0 4px" }}>
+      <div style={{ fontFamily:"'Space Mono',monospace", display:"flex", alignItems:"baseline", justifyContent:"center", gap:4 }}>
+        <span style={{ fontSize:"min(80px, 18vw)", fontWeight:700, lineHeight:1, letterSpacing:"-0.04em", color: crit ? "#fbbf24" : warn ? "#fb923c" : "#f1f5f9", transition:"color 0.8s" }}>{c.m}</span>
+        <span style={{ fontSize:"min(52px, 12vw)", fontWeight:300, color:"#334155", animation:"blink 1s steps(1) infinite", lineHeight:1 }}>:</span>
+        <span style={{ fontSize:"min(80px, 18vw)", fontWeight:700, lineHeight:1, letterSpacing:"-0.04em", color: crit ? "#fbbf24" : warn ? "#fb923c" : "#f1f5f9", transition:"color 0.8s" }}>{c.s}</span>
+      </div>
+      <div style={{ fontSize:13, color:"#64748b", marginTop:8, fontFamily:"'Space Mono',monospace", letterSpacing:"0.15em" }}>{label}</div>
+      {target && <div style={{ fontSize:15, color:"#94a3b8", marginTop:6, fontFamily:"'Space Mono',monospace" }}>ca. {fmt(target)} Uhr</div>}
+    </div>
+  );
+}
+
+function PhaseRow({ type, closeAt, openAt, trains, now }) {
+  const isOpen = type === "open";
+  const isCurrent = now >= (closeAt||0) && now < (openAt||Infinity);
+  const isPast = (openAt||0) < now;
+  const dur = durMin(closeAt, openAt);
+  const c = cd(openAt, now);
+  return (
+    <div style={{ padding:"18px 20px", background: isCurrent ? (isOpen ? "#021a0e" : "#1c0808") : "#080e1a", borderLeft: isCurrent ? `5px solid ${isOpen ? "#22c55e" : "#ef4444"}` : `5px solid ${isOpen ? "#064e3b" : "#2d1010"}`, borderBottom:"1px solid #151f30", opacity: isPast ? 0.3 : 1, transition:"all 0.5s" }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:12 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:12, flex:1, minWidth:0 }}>
+          <span style={{ width:14, height:14, borderRadius:"50%", flexShrink:0, background: isCurrent ? (isOpen ? "#22c55e" : "#ef4444") : (isOpen ? "#064e3b" : "#3b1111"), boxShadow: isCurrent ? `0 0 14px ${isOpen ? "#22c55e" : "#ef4444"}` : "none", animation: isCurrent ? "pulse 2s ease-in-out infinite" : "none" }}/>
+          <div style={{ minWidth:0 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+              <span style={{ fontSize:"min(22px, 5vw)", fontWeight:700, fontFamily:"'Space Mono',monospace", color: isCurrent ? (isOpen ? "#86efac" : "#fca5a5") : (isOpen ? "#4ade80" : "#f87171"), whiteSpace:"nowrap" }}>{fmt(closeAt)} – {fmt(openAt)}</span>
+              {isCurrent && <span style={{ fontSize:13, fontWeight:700, letterSpacing:"0.1em", color: isOpen ? "#22c55e" : "#ef4444", padding:"2px 10px", borderRadius:6, background: isOpen ? "#22c55e18" : "#ef444418" }}>{isOpen ? "OFFEN" : "ZU"}</span>}
+            </div>
+            <span style={{ fontSize:15, fontWeight:600, color: isOpen ? "#4ade8090" : "#f8717190", fontFamily:"'Space Mono',monospace" }}>{isOpen ? "🟢" : "🔴"} {isOpen ? "Schranke offen" : "Schranke geschlossen"} · ~{dur} Min</span>
+          </div>
+        </div>
+        <div style={{ fontSize:22, fontWeight:700, fontFamily:"'Space Mono',monospace", color:"#64748b", whiteSpace:"nowrap", flexShrink:0 }}>{dur}′</div>
+      </div>
+      {!isOpen && trains && trains.length > 0 && (
+        <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginTop:12 }}>
+          {trains.map((tr, i) => (<span key={i} style={{ display:"inline-flex", alignItems:"center", gap:5, padding:"4px 10px", borderRadius:6, background:"#0f172a", border:"1px solid #1e293b", fontSize:13, fontFamily:"'Space Mono',monospace", color: CAT[tr.cat]?.color || "#94a3b8" }}><span style={{ width:6, height:6, borderRadius:"50%", background: CAT[tr.cat]?.color || "#94a3b8" }}/>{tr.line}{tr.through && <span style={{ fontSize:10, color:"#475569" }}>⟶</span>}{tr.delay > 0 && <span style={{ color:"#ef4444", fontSize:11 }}>+{tr.delay}′</span>}</span>))}
+        </div>
+      )}
+      {isCurrent && (<div style={{ marginTop:10, fontSize:18, fontWeight:700, fontFamily:"'Space Mono',monospace", color: isOpen ? "#86efac" : "#fca5a5" }}>{isOpen ? "noch offen:" : "noch geschlossen:"} {c.m}:{c.s}</div>)}
+    </div>
+  );
+}
+
+function TrainList({ trains, now }) {
+  const list = trains.filter(t => (t.actual - now) / 60000 > -3 && (t.actual - now) / 60000 < 120).slice(0, 18);
+  return (
+    <div>
+      <div style={{ display:"grid", gridTemplateColumns:"65px 1fr 80px 55px", padding:"10px 20px", fontSize:11, color:"#475569", fontFamily:"'Space Mono',monospace", letterSpacing:"0.08em", borderBottom:"1px solid #1e293b", background:"#080e1a" }}>
+        <span>LINIE</span><span>ZIEL</span><span style={{textAlign:"right"}}>ZEIT</span><span style={{textAlign:"right"}}>IN</span>
+      </div>
+      {list.map((t, i) => {
+        const diff = Math.floor((t.actual - now) / 60000);
+        const color = CAT[t.cat]?.color || "#94a3b8";
+        return (
+          <div key={t.id+i} style={{ display:"grid", gridTemplateColumns:"65px 1fr 80px 55px", padding:"12px 20px", borderBottom:"1px solid #0f172a", opacity: diff < 0 ? 0.3 : 1, alignItems:"center", background: i === 0 && diff >= 0 ? "#0c1220" : "transparent" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+              <span style={{ width:4, height:24, borderRadius:2, background:color }}/>
+              <span style={{ fontSize:14, fontWeight:600, color, fontFamily:"'Space Mono',monospace" }}>{t.line.replace(/\s+/g,"")}</span>
+            </div>
+            <div>
+              <div style={{ fontSize:14, color:"#e2e8f0", fontWeight:500, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{t.through && "⟶ "}{t.dest}</div>
+              <div style={{ fontSize:11, color:"#475569" }}>Gl.{t.track}{t.through && " · Durchfahrt"}</div>
+            </div>
+            <div style={{ textAlign:"right", fontFamily:"'Space Mono',monospace" }}>
+              <span style={{ fontSize:15, fontWeight:600, color: t.delay > 0 ? "#ef4444" : "#cbd5e1" }}>{fmt(t.actual)}</span>
+              {t.delay > 0 && <div style={{ fontSize:11, color:"#ef4444" }}>+{t.delay}′</div>}
+            </div>
+            <div style={{ textAlign:"right", fontSize:14, fontWeight:600, fontFamily:"'Space Mono',monospace", color: diff <= 0 ? "#fbbf24" : diff <= 5 ? "#22c55e" : "#64748b" }}>{diff <= 0 ? "jetzt" : `${diff}′`}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function Timeline({ phases, now }) {
+  const start = new Date(now.getTime() - 5*60000);
+  const end = new Date(now.getTime() + 120*60000);
+  const tot = end - start;
+  const p = d => Math.max(0, Math.min(100, ((d-start)/tot)*100));
+  const marks = [];
+  const m = new Date(start); m.setMinutes(Math.ceil(m.getMinutes()/15)*15,0,0);
+  while (m < end) { marks.push(new Date(m)); m.setMinutes(m.getMinutes()+15); }
+  return (
+    <div style={{ padding:"20px" }}>
+      <div style={{ position:"relative", height:72, background:"#05291a", borderRadius:12, overflow:"hidden", border:"1px solid #064e3b" }}>
+        {phases.map((ph,i) => { const l=p(ph.closeAt), r=p(ph.openAt); if(r<=0||l>=100) return null; return (<div key={i} style={{ position:"absolute", top:0, bottom:0, left:`${Math.max(0,l)}%`, width:`${Math.min(100,r)-Math.max(0,l)}%`, background:"linear-gradient(180deg,#7f1d1d,#450a0a)", borderLeft:l>0?"1px solid #dc2626":"none", borderRight:r<100?"1px solid #dc2626":"none" }}>{(r-l)>6 && <div style={{ position:"absolute", top:"50%", left:"50%", transform:"translate(-50%,-50%)", fontSize:12, color:"#fca5a5", whiteSpace:"nowrap", fontFamily:"'Space Mono',monospace", fontWeight:600 }}>{ph.trains.length} Züge · ~{durMin(ph.closeAt,ph.openAt)}′</div>}</div>); })}
+        {marks.map((t,i) => (<div key={i} style={{ position:"absolute", top:0, bottom:0, left:`${p(t)}%`, width:1, background:"#1e293b50" }}><span style={{ position:"absolute", bottom:4, left:4, fontSize:11, color:"#475569", fontFamily:"'Space Mono',monospace", whiteSpace:"nowrap" }}>{fmt(t)}</span></div>))}
+        <div style={{ position:"absolute", top:0, bottom:0, left:`${p(now)}%`, width:2, background:"#fbbf24", zIndex:10, boxShadow:"0 0 12px #fbbf2480" }}><div style={{ position:"absolute", top:-4, left:-5, width:12, height:12, borderRadius:"50%", background:"#fbbf24", border:"2px solid #0f172a" }}/></div>
+      </div>
+      <div style={{ display:"flex", justifyContent:"center", gap:24, marginTop:12 }}>
+        {[{c:"#05291a",b:"#064e3b",l:"Offen"},{c:"#7f1d1d",b:"#dc2626",l:"Geschlossen"},{c:"#fbbf24",b:"#fbbf24",l:"Jetzt",dot:true}].map((x,i)=>(<div key={i} style={{ display:"flex", alignItems:"center", gap:6 }}>{x.dot ? <span style={{width:3,height:14,background:x.c}}/> : <span style={{width:16,height:12,borderRadius:3,background:x.c,border:`1px solid ${x.b}`}}/>}<span style={{ fontSize:12, color:"#64748b" }}>{x.l}</span></div>))}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [now, setNow] = useState(new Date());
+  const [tab, setTab] = useState("phasen");
+  const [showSettings, setShowSettings] = useState(false);
+  const [liveEnabled, setLiveEnabled] = useState(true);
+  const [apiTrains, setApiTrains] = useState(null);
+  const [apiStatus, setApiStatus] = useState("loading");
+  const [lastApiFetch, setLastApiFetch] = useState(null);
+  const [trafficKey, setTrafficKey] = useState("Hatv9ccQ0IXnhDXNtjWKsEyXutQ-p4thVQ6QKdhRmFw");
+  const [trafficData, setTrafficData] = useState(null);
+  const [trafficStatus, setTrafficStatus] = useState("loading"); // off | loading | live | error
+
+  useEffect(() => { const t = setInterval(() => setNow(new Date()), 500); return () => clearInterval(t); }, []);
+
+  const fetchApi = useCallback(async () => {
+    if (!liveEnabled) { setApiTrains(null); setApiStatus("off"); return; }
+    setApiStatus("loading");
+    const result = await fetchLiveTrains();
+    if (result && result.length > 0) { setApiTrains(result); setApiStatus("live"); setLastApiFetch(new Date()); }
+    else { setApiTrains(null); setApiStatus("error"); }
+  }, [liveEnabled]);
+
+  useEffect(() => { fetchApi(); if (liveEnabled) { const iv = setInterval(fetchApi, 90000); return () => clearInterval(iv); } }, [fetchApi]);
+
+  useEffect(() => {
+    if (!trafficKey) { setTrafficData(null); setTrafficStatus("off"); return; }
+    setTrafficStatus("loading");
+    const doFetch = async () => {
+      try {
+        const data = await fetchTrafficData(trafficKey);
+        if (data) { setTrafficData(data); setTrafficStatus("live"); }
+        else { setTrafficStatus("error"); }
+      } catch(e) { setTrafficStatus("error"); }
+    };
+    doFetch(); const iv = setInterval(doFetch, 120000); return () => clearInterval(iv);
+  }, [trafficKey]);
+
+  const epoch5 = Math.floor(now.getTime() / 300000);
+  const { trains, phases } = useMemo(() => {
+    if (apiTrains && apiTrains.length > 0) return { trains: apiTrains, phases: calcPhases(apiTrains) };
+    const base = buildSchedule(now);
+    const delayed = addDelays(base, epoch5);
+    return { trains: delayed, phases: calcPhases(delayed) };
+  }, [epoch5, apiTrains]);
+
+  const status = useMemo(() => getStatus(phases, now), [phases, now]);
+
+  const items = useMemo(() => {
+    const res = [];
+    const ws = new Date(now.getTime() - 15*60000);
+    const we = new Date(now.getTime() + 120*60000);
+    const rel = phases.filter(p => p.openAt > ws && p.closeAt < we);
+    for (let i = 0; i < rel.length; i++) {
+      const prev = i === 0 ? ws : rel[i-1].openAt;
+      if (rel[i].closeAt > prev && durMin(prev, rel[i].closeAt) >= 1) res.push({ type:"open", closeAt:prev, openAt:rel[i].closeAt, trains:[] });
+      res.push({ type:"closed", ...rel[i] });
+      if (i === rel.length - 1) { const nxt = phases.find(p => p.closeAt > rel[i].openAt); const oe = nxt ? Math.min(nxt.closeAt.getTime(), we.getTime()) : we.getTime(); if (oe > rel[i].openAt.getTime() && durMin(rel[i].openAt, new Date(oe)) >= 1) res.push({ type:"open", closeAt:rel[i].openAt, openAt:new Date(oe), trains:[] }); }
+    }
+    if (rel.length === 0) res.push({ type:"open", closeAt:ws, openAt:we, trains:[] });
+    return res;
+  }, [phases, Math.floor(now.getTime()/60000)]);
+
+  const closed = status.closed;
+  const queue = useMemo(() => estimateQueue(phases, now, trafficData ? trafficData.ratio : null), [phases, now, trafficData]);
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#020617", fontFamily:"'Instrument Sans','DM Sans',system-ui,sans-serif", color:"#e2e8f0", maxWidth:560, margin:"0 auto", paddingBottom:"env(safe-area-inset-bottom, 20px)" }}>
+      <style>{`
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+        @keyframes blink{0%,100%{opacity:1}50%{opacity:.1}}
+      `}</style>
+
+      <div style={{ padding:"24px 20px 16px", display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+        <div>
+          <div style={{ fontSize:11, letterSpacing:"0.2em", textTransform:"uppercase", color:"#475569", marginBottom:4 }}>Bahnübergang · Buchschlager Allee</div>
+          <div style={{ fontSize:28, fontWeight:700, color:"#f1f5f9", letterSpacing:"-0.02em" }}>BÜ Buchschlag</div>
+        </div>
+        <div style={{ display:"flex", alignItems:"flex-start", gap:10 }}>
+          <div style={{ textAlign:"right" }}>
+            <div style={{ fontSize:15, fontFamily:"'Space Mono',monospace", color:"#94a3b8" }}>{fmtS(now)}</div>
+            <div style={{ display:"inline-flex", alignItems:"center", gap:5, marginTop:4, padding:"2px 8px", borderRadius:6, fontSize:10, background: apiStatus === "live" ? "#22c55e18" : apiStatus === "error" ? "#ef444418" : "#1e293b40", border: apiStatus === "live" ? "1px solid #22c55e40" : apiStatus === "error" ? "1px solid #ef444440" : "1px solid #1e293b", color: apiStatus === "live" ? "#4ade80" : apiStatus === "error" ? "#f87171" : "#475569", fontFamily:"'Space Mono',monospace" }}>
+              <span style={{ width:5, height:5, borderRadius:"50%", background: apiStatus === "live" ? "#22c55e" : apiStatus === "error" ? "#ef4444" : "#475569" }}/>
+              {apiStatus === "live" ? "LIVE" : apiStatus === "loading" ? "Lade..." : apiStatus === "error" ? "API-Fehler" : "Modellfahrplan"}
+            </div>
+          </div>
+          <button onClick={() => { fetchApi(); if(trafficKey){setTrafficStatus("loading");fetchTrafficData(trafficKey).then(d=>{if(d){setTrafficData(d);setTrafficStatus("live")}else{setTrafficStatus("error")}}).catch(()=>setTrafficStatus("error"))} }} style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:12, width:44, height:44, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", fontSize:18, color:"#64748b", minWidth:44, flexShrink:0 }}>↻</button>
+          <button onClick={() => setShowSettings(true)} style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:12, width:44, height:44, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", fontSize:20, color:"#64748b", minWidth:44, flexShrink:0 }}>⚙</button>
+        </div>
+      </div>
+
+      <SettingsPanel show={showSettings} onClose={() => setShowSettings(false)} liveEnabled={liveEnabled} onToggleLive={() => setLiveEnabled(!liveEnabled)} trafficKey={trafficKey} onSaveTrafficKey={setTrafficKey} />
+
+      <div style={{ margin:"0 16px 20px", borderRadius:20, overflow:"hidden", background: closed ? "linear-gradient(175deg,#180505,#0a0202)" : "linear-gradient(175deg,#021a0c,#010a05)", border: closed ? "1px solid #7f1d1d" : "1px solid #064e3b", boxShadow: closed ? "0 0 50px #ef444412" : "0 0 50px #22c55e0a", transition:"all 1.5s ease" }}>
+        <div style={{ padding:"28px 24px 4px", textAlign:"center" }}>
+          <div style={{ display:"inline-flex", alignItems:"center", gap:14, padding:"10px 28px", borderRadius:50, background: closed ? "#ef444418" : "#22c55e18", border: closed ? "1px solid #ef444440" : "1px solid #22c55e40" }}>
+            <span style={{ width:16, height:16, borderRadius:"50%", background: closed ? "#ef4444" : "#22c55e", boxShadow: `0 0 20px ${closed ? "#ef4444" : "#22c55e"}`, animation:"pulse 2.5s ease-in-out infinite" }}/>
+            <span style={{ fontSize:28, fontWeight:700, letterSpacing:"0.06em", color: closed ? "#fca5a5" : "#86efac" }}>{closed ? "GESCHLOSSEN" : "OFFEN"}</span>
+          </div>
+          {closed && status.since && (<div style={{ fontSize:14, color:"#94a3b8", marginTop:10 }}>seit {fmt(status.since)} · {status.phase?.trains?.length || 0} Züge</div>)}
+        </div>
+        <Countdown target={status.until} now={now} label={closed ? "ÖFFNET IN" : "SCHLIESST IN"} />
+        <div style={{ padding:"12px 24px 24px", textAlign:"center" }}>
+          {closed && status.until && (()=>{ const r = cd(status.until, now); return r.t > 300 ? <div style={{ padding:"14px 18px", borderRadius:14, background:"#7f1d1d30", border:"1px solid #7f1d1d60", fontSize:16, color:"#fca5a5", fontWeight:600 }}>⚠️ Umweg empfohlen — noch über 5 Min geschlossen</div> : <div style={{ padding:"14px 18px", borderRadius:14, background:"#78350f25", border:"1px solid #92400e50", fontSize:16, color:"#fde68a", fontWeight:600 }}>⏳ Warten lohnt sich — öffnet bald</div>; })()}
+          {!closed && status.until && (()=>{ const r = cd(status.until, now); return r.t < 180 ? <div style={{ padding:"14px 18px", borderRadius:14, background:"#14532d50", border:"1px solid #22c55e60", fontSize:16, color:"#86efac", fontWeight:600 }}>🚗 Jetzt schnell überqueren!</div> : <div style={{ padding:"14px 18px", borderRadius:14, background:"#14532d25", border:"1px solid #064e3b50", fontSize:16, color:"#a7f3d0", fontWeight:600 }}>✅ Freie Überfahrt — noch ~{Math.ceil(r.t/60)} Min offen</div>; })()}
+        </div>
+      </div>
+
+      <div style={{ display:"flex", margin:"0 16px", background:"#080e1a", borderRadius:"14px 14px 0 0", overflow:"hidden", border:"1px solid #1e293b", borderBottom:"none" }}>
+        {[{id:"phasen",l:"⏱ Phasen"},{id:"zuege",l:"🚂 Züge"},{id:"timeline",l:"📊 Timeline"}].map(t=>(<button key={t.id} onClick={()=>setTab(t.id)} style={{ flex:1, padding:"16px 0", fontSize:15, fontWeight:tab===t.id?700:400, color:tab===t.id?"#f1f5f9":"#64748b", background:tab===t.id?"#1e293b":"transparent", border:"none", cursor:"pointer", fontFamily:"'Instrument Sans',sans-serif", minHeight:48 }}>{t.l}</button>))}
+      </div>
+
+      <div style={{ margin:"0 16px 20px", background:"#080e1a", borderRadius:"0 0 14px 14px", border:"1px solid #1e293b", overflow:"hidden" }}>
+        {tab === "phasen" && (<div><div style={{ padding:"14px 20px", fontSize:13, color:"#475569", borderBottom:"1px solid #151f30", fontFamily:"'Space Mono',monospace", letterSpacing:"0.08em" }}>NÄCHSTE 2 STUNDEN · OFFEN & GESCHLOSSEN</div>{items.map((it, i) => (<PhaseRow key={`${it.type}-${i}`} type={it.type} closeAt={it.closeAt} openAt={it.openAt} trains={it.trains} now={now} />))}</div>)}
+        {tab === "zuege" && <TrainList trains={trains} now={now} />}
+        {tab === "timeline" && <Timeline phases={phases} now={now} />}
+      </div>
+
+      <TrafficDisplay trafficData={trafficData} trafficKey={trafficKey} trafficStatus={trafficStatus} />
+      <QueueDisplay queue={queue} phases={phases} now={now} status={status} />
+
+      <div style={{ margin:"0 16px 16px", padding:"18px 20px", background:"#080e1a", borderRadius:14, border:"1px solid #1e293b" }}>
+        <div style={{ fontSize:12, color:"#475569", letterSpacing:"0.12em", marginBottom:12 }}>ZUGVERKEHR AUF 5 GLEISEN</div>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
+          {[{l:"S6 S-Bahn",s:"Gl. 2+3 · 15′/30′",c:"#2dd4bf"},{l:"RB 61 Dreieichbahn",s:"Gl. 1 · 30′/60′",c:"#f472b6"},{l:"ICE / IC / EC",s:"Gl. 4+5 · Durchfahrt",c:"#a78bfa"},{l:"Güterverkehr",s:"Gl. 4+5 · unregelm.",c:"#94a3b8"}].map((x,i)=>(<div key={i} style={{ display:"flex", alignItems:"center", gap:10, padding:"10px 12px", background:"#020617", borderRadius:8 }}><span style={{ width:4, height:28, borderRadius:2, background:x.c, flexShrink:0 }}/><div><div style={{ fontSize:13, fontWeight:600, color:"#cbd5e1" }}>{x.l}</div><div style={{ fontSize:10, color:"#475569" }}>{x.s}</div></div></div>))}
+        </div>
+      </div>
+
+      <div style={{ margin:"0 16px 16px", padding:"18px 20px", background:"#080e1a", borderRadius:14, border:"1px solid #1e293b" }}>
+        <div style={{ fontSize:12, color:"#475569", letterSpacing:"0.12em", marginBottom:12 }}>ALTERNATIVROUTEN</div>
+        {[{t:"Über Sprendlingen / Walldorfer Str.",s:"+5–8 Min · westliche Umfahrung"},{t:"Über Neu-Isenburg / B44",s:"+8–12 Min · bei Schließung >10 Min"}].map((x,i)=>(<div key={i} style={{ padding:"12px 14px", background:"#020617", borderRadius:8, borderLeft:"3px solid #3b82f6", marginBottom:i===0?8:0 }}><div style={{ fontSize:14, fontWeight:600, color:"#93c5fd" }}>{x.t}</div><div style={{ fontSize:12, color:"#64748b", marginTop:3 }}>{x.s}</div></div>))}
+      </div>
+
+      <div style={{ padding:"8px 20px calc(32px + env(safe-area-inset-bottom, 0px))", textAlign:"center" }}>
+        <div style={{ fontSize:10, color:"#1e293b", lineHeight:1.8 }}>
+          {apiStatus === "live" ? <>Live-Daten via db.transport.rest · Letzter Abruf: {lastApiFetch ? fmtS(lastApiFetch) : "–"}<br/>Aktualisierung alle 90 Sek · Keine offizielle DB-App</> : <>Prognose basierend auf Modellfahrplan · Keine offizielle DB-App<br/>Für Live-Daten: ⚙️ → Echte Zugdaten aktivieren</>}
+          <br/>Alle Angaben ohne Gewähr
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>
